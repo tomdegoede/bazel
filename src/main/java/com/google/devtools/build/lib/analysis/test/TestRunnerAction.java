@@ -15,6 +15,7 @@
 package com.google.devtools.build.lib.analysis.test;
 
 import static com.google.common.base.Preconditions.checkState;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.auto.value.AutoValue;
 import com.google.common.annotations.VisibleForTesting;
@@ -60,6 +61,7 @@ import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.server.FailureDetails.Execution.Code;
+import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.TestAction;
 import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.lib.util.LoggingUtil;
@@ -71,11 +73,14 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.view.test.TestStatus.TestResultData;
 import com.google.devtools.common.options.TriState;
 import com.google.protobuf.ExtensionRegistry;
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
@@ -97,6 +102,7 @@ public class TestRunnerAction extends AbstractAction
   private static final String GUID = "cc41f9d0-47a6-11e7-8726-eb6ce83a8cc8";
   public static final String MNEMONIC = "TestRunner";
 
+  private final NestedSet<Artifact> allInputs;
   private final Artifact testSetupScript;
   private final Artifact testXmlGeneratorScript;
   private final Artifact collectCoverageScript;
@@ -189,6 +195,7 @@ public class TestRunnerAction extends AbstractAction
         nonNullAsSet(testLog, cacheStatus, coverageArtifact, coverageDirectory),
         configuration.getActionEnvironment());
     Preconditions.checkState((collectCoverageScript == null) == (coverageArtifact == null));
+    this.allInputs = inputs;
     this.testSetupScript = testSetupScript;
     this.testXmlGeneratorScript = testXmlGeneratorScript;
     this.collectCoverageScript = collectCoverageScript;
@@ -533,6 +540,32 @@ public class TestRunnerAction extends AbstractAction
       }
     }
   }
+  
+  @Override
+  public boolean isShareable() {
+    return false;
+  }
+
+  @Override
+  public boolean discoversInputs() {
+    return true;
+  }
+
+  @Override
+  public NestedSet<Artifact> getAllowedDerivedInputs() {
+    return getInputs();
+  }
+
+  @Override
+  public NestedSet<Artifact> discoverInputs(ActionExecutionContext actionExecutionContext)
+      throws ActionExecutionException, InterruptedException {
+    // We need to "re-discover" all the original inputs: the unused ones that were removed
+    // might now be needed.
+
+    // TODO using allInputs breaks because the consuming logic does not understand the middleman
+    updateInputs(executionSettings.getRunfiles().getAllArtifacts());
+    return executionSettings.getRunfiles().getAllArtifacts();
+  }
 
   void createEmptyOutputs(ActionExecutionContext context) throws IOException {
     for (Artifact output : TestRunnerAction.this.getMandatoryOutputs()) {
@@ -860,7 +893,9 @@ public class TestRunnerAction extends AbstractAction
   public ActionResult execute(ActionExecutionContext actionExecutionContext)
       throws ActionExecutionException, InterruptedException {
     TestActionContext context = actionExecutionContext.getContext(TestActionContext.class);
-    return execute(actionExecutionContext, context);
+    ActionResult result = execute(actionExecutionContext, context);
+    afterExecute(actionExecutionContext, result.spawnResults());
+    return result;
   }
 
   @VisibleForTesting
@@ -877,6 +912,78 @@ public class TestRunnerAction extends AbstractAction
     } finally {
       unconditionalExecution = null;
     }
+  }
+
+  private InputStream getUnusedInputListInputStream(
+      ActionExecutionContext actionExecutionContext, List<SpawnResult> spawnResults, ActionInput unusedRunfiles)
+      throws IOException {
+
+    // Check if the file is in-memory.
+    // Note: SpawnActionContext guarantees that the first list entry exists and corresponds to the
+    // executed spawn.
+    InputStream inputStream = spawnResults.get(0).getInMemoryOutput(unusedRunfiles);
+    if (inputStream != null) {
+      return inputStream;
+    }
+
+    return actionExecutionContext
+        .getPathResolver()
+        .toPath(unusedRunfiles)
+        .getInputStream();
+  }
+
+  private void afterExecute(
+      ActionExecutionContext actionExecutionContext, List<SpawnResult> spawnResults)
+      throws ActionExecutionException {
+    Path unusedRunfilesPath = resolve(actionExecutionContext.getExecRoot()).getUnusedRunfilesLogPath();
+    if (!unusedRunfilesPath.exists()) {
+      return;
+    }
+    ActionInput unusedRunfiles = ActionInputHelper.fromPath(unusedRunfilesPath.toString());
+
+    Artifact.ArtifactExpander artifactExpander = actionExecutionContext.getArtifactExpander();
+    
+    // TODO the runfiles middleman is not mapped in ArtifactExpander
+    // TODO correctly map special runfiles behavior such as symlinks
+
+    Map<String, Artifact> usedInputs = new HashMap<>();
+    for (Artifact input : executionSettings.getRunfiles().getAllArtifacts().toList()) {
+      if (input.isMiddlemanArtifact() || input.isTreeArtifact()) {
+        List<Artifact> artifacts = new ArrayList<>();
+        artifactExpander.expand(input, artifacts);
+        for (Artifact artifact : artifacts) {
+          usedInputs.put(artifact.getRootRelativePath().toString(), artifact);
+        }
+      } else {
+        usedInputs.put(input.getRootRelativePath().toString(), input);
+      }
+    }
+
+    try (BufferedReader br =
+        new BufferedReader(
+            new InputStreamReader(
+                getUnusedInputListInputStream(actionExecutionContext, spawnResults, unusedRunfiles), UTF_8))) {
+      String line;
+      while ((line = br.readLine()) != null) {
+        line = line.trim();
+        if (line.isEmpty()) {
+          continue;
+        }
+        usedInputs.remove(line);
+      }
+    } catch (IOException e) {
+      throw new EnvironmentalExecException(
+          e,
+          createFailureDetail("Unused inputs read failure"))
+        .toActionExecutionException(this);
+    }
+    updateInputs(NestedSetBuilder.wrap(Order.STABLE_ORDER, usedInputs.values()));
+  }
+
+  private static FailureDetail createFailureDetail(String message) {
+    return FailureDetail.newBuilder()
+        .setMessage(message)
+        .build();
   }
 
   @Override
